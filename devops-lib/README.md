@@ -10,6 +10,7 @@ Optional extras add YAML config (`dsops[yaml]`) and Redis locks (`dsops[redis]`)
 | --- | --- |
 | `dsops.resilience` | `retry` (sync + async, exponential backoff, full jitter), `CircuitBreaker`, `TokenBucket` rate limiter, `Bulkhead` |
 | `dsops.connectors` | Hive-style partitioned datasets on disk (`dt=2026-11-01/…`): JSONL or CSV, optional gzip, staged writes with atomic commit, append / overwrite / error / ignore modes, partition-pruned reads |
+| `dsops.connectors.sql` | Postgres (psycopg) and SQLite: batch writes in one transaction (append / upsert / replace-where), streaming reads via server-side cursors, incremental `read_since`, `ping` for health checks |
 | `dsops.config` | Typed dataclass config, layered: defaults → TOML/JSON/YAML files → env vars → overrides; `Secret` values that never get logged |
 | `dsops.logs` | JSON logs with context (`job_id`, `run_id`, …) that follows work across threads and asyncio tasks |
 | `dsops.metrics` | `Counter`, `Gauge`, `Histogram` with labels; Prometheus text output, no client library |
@@ -103,6 +104,36 @@ computed: `partition_by={"dt": lambda r: r["event_time"][:10]}`.
 Limits: each partition is committed atomically, but a write spanning several
 partitions is not one transaction. If a crash hits mid-commit, replaced data
 sits in `_trash/<write_id>/` for recovery. CSV reads every value back as a string.
+
+### Postgres and SQLite
+
+```python
+from dsops.connectors import Database
+
+db = Database.postgres("postgresql://etl@db:5432/warehouse")   # pip install 'dsops[postgres]'
+
+# Idempotent daily reload: delete the day and insert it again, in one transaction.
+db.write_rows("orders", rows, mode="replace", replace_where={"dt": "2026-11-01"})
+
+# Merge on a primary key.
+db.write_rows("customers", rows, mode="upsert", key=["customer_id"])
+
+# Stream a big table: a server-side cursor keeps memory flat.
+for row in db.stream("select * from events where dt = %s", ["2026-11-01"]):
+    ...
+
+# Incremental extraction: everything newer than the last value you saw.
+for row in db.read_since("events", "updated_at", last_seen):
+    last_seen = row["updated_at"]
+
+health.register("postgres", db.ping)
+```
+
+Every `write_rows` call is one transaction: all rows land or none do, and
+readers keep seeing the old rows until commit. Each thread gets its own
+connection, reopened if the server dropped it; connecting is retried with
+backoff. `Database.sqlite("local.db")` has the same API (raw SQL uses `?`
+placeholders instead of `%s`), which makes it useful for tests and local runs.
 
 ### Calling things that fail
 
@@ -235,4 +266,7 @@ ETL_SOURCE__FAILURE_RATE=0.5 dsops dag run examples/etl_pipeline.py:dag --param 
 cd devops-lib
 pip install -e ".[dev]"
 pytest -q
+
+# include the Postgres tests (CI runs them against a postgres:16 service)
+DSOPS_TEST_POSTGRES_DSN=postgresql://postgres:postgres@localhost:5432/postgres pytest -q
 ```

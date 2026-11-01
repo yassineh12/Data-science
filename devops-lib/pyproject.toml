@@ -24,8 +24,9 @@ dependencies = []
 [project.optional-dependencies]
 yaml = ["pyyaml>=6"]
 redis = ["redis>=5"]
-all = ["pyyaml>=6", "redis>=5"]
-dev = ["pytest>=8", "pytest-asyncio>=0.23", "pyyaml>=6"]
+postgres = ["psycopg[binary]>=3.1"]
+all = ["pyyaml>=6", "redis>=5", "psycopg[binary]>=3.1"]
+dev = ["pytest>=8", "pytest-asyncio>=0.23", "pyyaml>=6", "psycopg[binary]>=3.1"]
 
 [project.scripts]
 dsops = "dsops.cli:main"
