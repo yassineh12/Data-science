@@ -1,0 +1,22 @@
+# Local stack: your app + Redis (locks/idempotency) + Prometheus (scrapes /metrics).
+#   docker compose -f templates/docker-compose.yml up --build
+services:
+  app:
+    build:
+      context: ..
+      dockerfile: templates/Dockerfile
+    environment:
+      APP_REDIS__URL: redis://redis:6379/0
+    ports: ["9100:9100"]
+    depends_on: [redis]
+
+  redis:
+    image: redis:7-alpine
+    ports: ["6379:6379"]
+
+  prometheus:
+    image: prom/prometheus:v2.54.1
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    ports: ["9090:9090"]
+    depends_on: [app]

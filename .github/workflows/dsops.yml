@@ -1,0 +1,44 @@
+name: dsops
+
+on:
+  push:
+    paths: ["devops-lib/**", ".github/workflows/dsops.yml"]
+  pull_request:
+    paths: ["devops-lib/**", ".github/workflows/dsops.yml"]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12", "3.13"]
+    defaults:
+      run:
+        working-directory: devops-lib
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - run: pip install -e '.[dev]'
+      - run: pytest -q
+      - name: Example pipeline runs end to end
+        run: dsops dag run examples/etl_pipeline.py:dag --param rows=300
+
+  build:
+    needs: test
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: devops-lib
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install build && python -m build
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dsops-dist
+          path: devops-lib/dist/
