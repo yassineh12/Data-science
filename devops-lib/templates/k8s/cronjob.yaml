@@ -1,0 +1,29 @@
+# Batch pipeline on a schedule. The run id is the logical date, so a retried Job
+# resumes from checkpoints on the shared volume instead of starting over.
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: orders-etl
+spec:
+  schedule: "17 2 * * *"
+  concurrencyPolicy: Forbid
+  jobTemplate:
+    spec:
+      backoffLimit: 3
+      template:
+        spec:
+          restartPolicy: Never
+          containers:
+            - name: etl
+              image: ghcr.io/your-org/your-pipeline:latest
+              command: ["/bin/sh", "-c"]
+              args:
+                - >
+                  dsops --log-format json dag run my_pkg.pipelines:dag
+                  --run-id "$(date -u -d yesterday +%F)"
+                  --param date="\"$(date -u -d yesterday +%F)\""
+                  --checkpoint-dir /checkpoints
+              volumeMounts: [{ name: checkpoints, mountPath: /checkpoints }]
+          volumes:
+            - name: checkpoints
+              persistentVolumeClaim: { claimName: etl-checkpoints }

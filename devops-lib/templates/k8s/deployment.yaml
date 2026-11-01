@@ -1,0 +1,38 @@
+# Long-running worker wired to dsops' ops server (/livez, /readyz, /metrics).
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: dsops-worker
+  labels: { app: dsops-worker }
+spec:
+  replicas: 3
+  selector:
+    matchLabels: { app: dsops-worker }
+  template:
+    metadata:
+      labels: { app: dsops-worker }
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9100"
+        prometheus.io/path: /metrics
+    spec:
+      terminationGracePeriodSeconds: 60   # time to drain: call health.set_ready(False) on SIGTERM
+      containers:
+        - name: worker
+          image: ghcr.io/your-org/your-pipeline:latest
+          ports: [{ name: ops, containerPort: 9100 }]
+          env:
+            - name: POD_NAME           # stable node id for ConsistentHashRing
+              valueFrom: { fieldRef: { fieldPath: metadata.name } }
+            - name: APP_DB__PASSWORD
+              valueFrom: { secretKeyRef: { name: app-secrets, key: db-password } }
+          livenessProbe:
+            httpGet: { path: /livez, port: ops }
+            periodSeconds: 10
+          readinessProbe:
+            httpGet: { path: /readyz, port: ops }
+            periodSeconds: 5
+            failureThreshold: 2
+          resources:
+            requests: { cpu: 250m, memory: 256Mi }
+            limits: { memory: 1Gi }
