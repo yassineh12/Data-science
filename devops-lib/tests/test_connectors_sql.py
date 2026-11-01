@@ -71,30 +71,32 @@ def test_upsert_merges_by_key(db, table):
     assert got == {0: "n0", 1: "updated", 2: "n2", 7: "new"}
 
 
-def test_replace_where_is_an_idempotent_partition_reload(db, table):
+def test_overwrite_where_is_an_idempotent_partition_reload(db, table):
     db.write_rows(table, rows(5, dt="2026-10-31"))
     db.write_rows(table, rows(5, dt="2026-11-01", start=100))
     for _ in range(2):  # re-running the day must not duplicate it
-        stats = db.write_rows(table, rows(3, dt="2026-11-01", start=100), mode="replace",
-                              replace_where={"dt": "2026-11-01"})
+        stats = db.write_rows(table, rows(3, dt="2026-11-01", start=100), mode="overwrite",
+                              where={"dt": "2026-11-01"})
     assert stats.deleted == 3 and stats.rows == 3
     p = db.dialect.placeholder
     assert db.scalar(f"SELECT COUNT(*) FROM {table} WHERE dt = {p}", ["2026-11-01"]) == 3
     assert db.scalar(f"SELECT COUNT(*) FROM {table} WHERE dt = {p}", ["2026-10-31"]) == 5
 
 
-def test_replace_whole_table_and_null_condition(db, table):
+def test_overwrite_whole_table_and_null_condition(db, table):
     db.write_rows(table, rows(4) + [{"id": 50, "dt": None, "name": "x", "amount": 0}])
-    assert db.write_rows(table, [], mode="replace", replace_where={"dt": None}).deleted == 1
-    assert db.write_rows(table, rows(1), mode="replace", replace_where={}).deleted == 4
+    assert db.write_rows(table, [], mode="overwrite", where={"dt": None}).deleted == 1
+    assert db.write_rows(table, rows(1), mode="overwrite", where={}).deleted == 4
     assert count(db, table) == 1
 
 
 def test_write_validation(db, table):
-    with pytest.raises(SQLError, match="needs key"):
+    with pytest.raises(ValueError, match="needs key"):
         db.write_rows(table, rows(1), mode="upsert")
-    with pytest.raises(SQLError, match="replace_where"):
-        db.write_rows(table, rows(1), mode="replace")
+    with pytest.raises(ValueError, match="needs where"):
+        db.write_rows(table, rows(1), mode="overwrite")
+    with pytest.raises(ValueError, match="only applies"):
+        db.write_rows(table, rows(1), where={"dt": "x"})
     with pytest.raises(SQLError, match="not in"):
         db.write_rows(table, [{"id": 1}, {"id": 2, "surprise": 1}])
     assert count(db, table) == 0
@@ -165,14 +167,14 @@ def test_ping_and_reconnect(db):
 def test_quoting_and_sql_generation():
     assert quote_ident("analytics.orders") == '"analytics"."orders"'
     assert quote_ident('we"ird') == '"we""ird"'
-    with pytest.raises(SQLError):
+    with pytest.raises(ValueError):
         quote_ident("")
     sql = POSTGRES.upsert_sql("s.t", ["id", "v"], ["id"])
     assert sql == ('INSERT INTO "s"."t" ("id", "v") VALUES (%s, %s) '
                    'ON CONFLICT ("id") DO UPDATE SET "v" = excluded."v"')
     assert SQLITE.upsert_sql("t", ["id"], ["id"]).endswith('ON CONFLICT ("id") DO NOTHING')
     assert SQLITE.where({"a": 1, "b": None}) == ('"a" = ? AND "b" IS NULL', [1])
-    with pytest.raises(SQLError):
+    with pytest.raises(ValueError):
         POSTGRES.upsert_sql("t", ["v"], ["id"])
 
 

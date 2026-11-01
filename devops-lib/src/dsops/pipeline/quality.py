@@ -13,6 +13,7 @@ via ``to_dict("records")``), but pandas is never imported here.
     ])
     report = validate_records(rows, schema, min_rows=1)
     report.raise_if(max_error_rate=0.01)   # fail the pipeline if >1% of rows are bad
+    log.info("quality", extra=report.to_dict())
     load(report.valid)                     # quarantine report.invalid elsewhere
 """
 
@@ -23,10 +24,12 @@ from collections import Counter as _Counter
 from dataclasses import dataclass, field
 from typing import Any, Callable, Iterable, Mapping
 
+from ..errors import DsopsError
+
 Check = Callable[[Any], "str | None"]  # returns an error message, or None if the value is fine
 
 
-class DataQualityError(Exception):
+class DataQualityError(DsopsError):
     def __init__(self, message: str, report: "QualityReport"):
         super().__init__(message)
         self.report = report
@@ -147,7 +150,7 @@ class QualityReport:
                 f"top fields: {top}", self)
         return self
 
-    def summary(self) -> dict[str, Any]:
+    def to_dict(self) -> dict[str, Any]:
         return {"total": self.total, "valid": len(self.valid), "invalid": len(self.invalid),
                 "error_rate": round(self.error_rate, 6), "field_errors": dict(self.field_errors),
                 "dataset_errors": list(self.dataset_errors)}

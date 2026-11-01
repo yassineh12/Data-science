@@ -1,27 +1,28 @@
-"""Hive-style partitioned datasets on a local or mounted filesystem.
+"""Hive-style partitioned datasets on a local directory or S3.
 
 Layout::
 
-    root/
+    root/                                   (a path, or s3://bucket/prefix)
       dt=2026-11-01/country=FR/part-<write_id>-00000.jsonl.gz
       dt=2026-11-01/country=US/part-<write_id>-00000.jsonl.gz
-      _manifests/20261101T020000Z-<write_id>.json     # what each write produced
+      _manifests/<write_id>.json             # files, rows and bytes of each committed write
 
-Writes are staged under ``root/_staging/<write_id>/`` and only moved into place
+Writes are staged under ``root/_staging/<write_id>/`` and moved into place only
 when the writer commits, so readers never see half-written files. If the block
 raises, the staged files are deleted and the dataset is untouched.
 
 ::
 
-    with PartitionedWriter("lake/orders", partition_by=["dt"], mode="overwrite") as w:
+    with PartitionedWriter("s3://lake/orders", partition_by=["dt"], mode="overwrite") as w:
         for batch in batches:
             w.write(batch)
     print(w.result.rows, w.result.partitions)
 
-    rows = list(read_partitioned("lake/orders", filters={"dt": "2026-11-01"}))
+    rows = list(read_partitioned("s3://lake/orders", filters={"dt": "2026-11-01"}))
 
 Formats: ``jsonl`` (types preserved as JSON allows) and ``csv`` (everything
-becomes a string on read). Add ``compression="gzip"`` for either.
+becomes a string on read). Add ``compression="gzip"`` for either. See
+:mod:`dsops.connectors.storage` for how local and S3 commits differ.
 """
 
 from __future__ import annotations
@@ -33,14 +34,14 @@ import io
 import json
 import os
 import re
-import shutil
 import uuid
+from contextlib import nullcontext
 from dataclasses import asdict, dataclass, field
-from pathlib import Path
-from typing import IO, Any, Callable, Iterable, Iterator, Mapping, Sequence
+from typing import IO, Any, BinaryIO, Callable, Iterable, Iterator, Mapping, Sequence
 from urllib.parse import quote, unquote
 
-from ..distributed import FileLock
+from ..errors import DsopsError
+from .storage import Storage, join, open_storage
 
 NULL_PARTITION = "__HIVE_DEFAULT_PARTITION__"
 FORMATS = ("jsonl", "csv")
@@ -48,9 +49,10 @@ MODES = ("append", "overwrite", "error", "ignore")
 _KEY_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_]*$")
 
 PartitionSpec = Sequence[str] | Mapping[str, Callable[[Mapping[str, Any]], Any]]
+Root = str | os.PathLike[str] | Storage
 
 
-class DatasetError(Exception):
+class DatasetError(DsopsError):
     pass
 
 
@@ -76,14 +78,18 @@ def partition_path(values: Mapping[str, Any]) -> str:
     return "/".join(f"{k}={encode_value(v)}" for k, v in values.items())
 
 
-def parse_partition_path(rel: str | Path) -> dict[str, str | None]:
+def parse_partition_path(rel: str | os.PathLike[str]) -> dict[str, str | None]:
     out: dict[str, str | None] = {}
-    for part in Path(rel).parts:
+    for part in os.fspath(rel).replace(os.sep, "/").split("/"):
         key, sep, val = part.partition("=")
         if not sep:
             break
         out[key] = decode_value(val)
     return out
+
+
+def _parent(key: str) -> str:
+    return key.rsplit("/", 1)[0] if "/" in key else ""
 
 
 # --------------------------------------------------------------------------- #
@@ -100,7 +106,7 @@ class FileInfo:
 
 
 @dataclass
-class WriteResult:
+class DatasetWriteResult:
     write_id: str
     root: str
     mode: str
@@ -113,11 +119,11 @@ class WriteResult:
 
     @property
     def partitions(self) -> list[str]:
-        return sorted({str(Path(f.path).parent) for f in self.files})
+        return sorted({_parent(f.path) for f in self.files})
 
 
 class PartitionedWriter:
-    """Buffer records per partition, write files to a staging area, commit atomically per partition.
+    """Buffer records per partition, stage files, then commit partition by partition.
 
     ``mode`` decides what happens to a partition that already has data:
 
@@ -125,11 +131,14 @@ class PartitionedWriter:
     overwrite  replace only the partitions this write touches ("dynamic partition overwrite")
     error      raise :class:`DatasetError` before anything is changed
     ignore     leave the existing partition alone and drop the new rows for it
+
+    ``lock``: ``True`` uses the storage's own lock (a file lock locally, none on S3),
+    ``False`` disables locking, or pass any context manager (e.g. a ``RedisLock``).
     """
 
     def __init__(
         self,
-        root: str | os.PathLike[str],
+        root: Root,
         *,
         partition_by: PartitionSpec = (),
         format: str = "jsonl",
@@ -137,7 +146,7 @@ class PartitionedWriter:
         mode: str = "append",
         max_rows_per_file: int = 100_000,
         write_id: str | None = None,
-        lock: bool = True,
+        lock: bool | Any = True,
     ):
         if format not in FORMATS:
             raise ValueError(f"format must be one of {FORMATS}")
@@ -148,7 +157,7 @@ class PartitionedWriter:
         if max_rows_per_file < 1:
             raise ValueError("max_rows_per_file must be >= 1")
 
-        self.root = Path(root)
+        self.storage = open_storage(root)
         if isinstance(partition_by, Mapping):
             self._partition_fns = dict(partition_by)
         else:
@@ -163,12 +172,12 @@ class PartitionedWriter:
         self.max_rows_per_file = max_rows_per_file
         self.write_id = write_id or _dt.datetime.now(_dt.timezone.utc).strftime("%Y%m%dT%H%M%S") + "-" + uuid.uuid4().hex[:8]
         self._lock = lock
-        self._staging = self.root / "_staging" / self.write_id
+        self._staging = join("_staging", self.write_id)
         self._buffers: dict[str, tuple[dict[str, Any], list[Mapping[str, Any]]]] = {}
         self._counters: dict[str, int] = {}
         self._files: list[FileInfo] = []
         self._state = "open"
-        self.result: WriteResult | None = None
+        self.result: DatasetWriteResult | None = None
 
     @property
     def extension(self) -> str:
@@ -201,66 +210,65 @@ class PartitionedWriter:
             return
         idx = self._counters.get(rel, 0)
         self._counters[rel] = idx + 1
-        name = f"part-{self.write_id}-{idx:05d}{self.extension}"
-        target_dir = self._staging / rel if rel else self._staging
-        target_dir.mkdir(parents=True, exist_ok=True)
-        path = target_dir / name
-        with _open_write(path, self.compression) as fh:
-            _serialise(fh, rows, self.format)
-        file_rel = f"{rel}/{name}" if rel else name
-        self._files.append(FileInfo(file_rel, values, len(rows), path.stat().st_size))
+        key = join(rel, f"part-{self.write_id}-{idx:05d}{self.extension}")
+        data = _encode(rows, self.format, self.compression)
+        self.storage.write_bytes(join(self._staging, key), data)
+        self._files.append(FileInfo(key, values, len(rows), len(data)))
 
     # ------------------------------------------------------------ committing
 
-    def commit(self) -> WriteResult:
+    def _guard(self) -> Any:
+        if self._lock is True:
+            return self.storage.lock()
+        if self._lock is False or self._lock is None:
+            return nullcontext()
+        return self._lock
+
+    def commit(self) -> DatasetWriteResult:
         if self._state != "open":
             raise DatasetError(f"writer is {self._state}")
         for rel in list(self._buffers):
             self._flush(rel)
 
-        result = WriteResult(self.write_id, str(self.root), self.mode)
+        st = self.storage
+        result = DatasetWriteResult(self.write_id, st.url, self.mode)
         by_partition: dict[str, list[FileInfo]] = {}
         for f in self._files:
-            by_partition.setdefault(str(Path(f.path).parent) if "/" in f.path else "", []).append(f)
+            by_partition.setdefault(_parent(f.path), []).append(f)
+        trash = join("_trash", self.write_id)
 
-        self.root.mkdir(parents=True, exist_ok=True)
-        guard = FileLock(self.root / "_lock") if self._lock else None
-        if guard:
-            guard.acquire()
         try:
-            existing = {rel for rel in by_partition if _has_data(self.root / rel if rel else self.root)}
-            if self.mode == "error" and existing:
-                raise DatasetError(f"partition(s) already exist: {sorted(existing)}")
+            with self._guard():
+                existing = {rel: _data_files(st, rel) for rel in by_partition}
+                existing = {rel: old for rel, old in existing.items() if old}
+                if self.mode == "error" and existing:
+                    raise DatasetError(f"partition(s) already exist: {sorted(existing)}")
 
-            trash = self.root / "_trash" / self.write_id
-            for rel, files in sorted(by_partition.items()):
-                dest = self.root / rel if rel else self.root
-                if rel in existing and self.mode == "ignore":
-                    result.skipped.append(rel)
-                    continue
-                if rel in existing and self.mode == "overwrite":
-                    if rel:
-                        (trash / rel).parent.mkdir(parents=True, exist_ok=True)
-                        os.replace(dest, trash / rel)
-                    else:  # unpartitioned dataset: swap out the data files only
-                        trash.mkdir(parents=True, exist_ok=True)
-                        for old in _data_files(dest):
-                            os.replace(old, trash / old.name)
-                dest.mkdir(parents=True, exist_ok=True)
-                for f in files:
-                    os.replace(self._staging / f.path, self.root / f.path)
-                result.files.extend(files)
-            shutil.rmtree(trash, ignore_errors=True)
-            self._write_manifest(result)
+                for rel, files in sorted(by_partition.items()):
+                    old = existing.get(rel, [])
+                    if old and self.mode == "ignore":
+                        result.skipped.append(rel)
+                        continue
+                    if old and self.mode == "overwrite" and st.swap_prefix(
+                            join(self._staging, rel), rel, join(trash, rel)):
+                        result.files.extend(files)  # whole partition swapped in one rename
+                        continue
+                    new_keys = {f.path for f in files}
+                    for f in files:
+                        st.move(join(self._staging, f.path), f.path)
+                    if self.mode == "overwrite":
+                        for key in old:
+                            if key not in new_keys:  # same write_id re-run: keep what we just wrote
+                                st.delete(key)
+                    result.files.extend(files)
+                st.delete_prefix(trash)
+                st.write_bytes(join("_manifests", f"{self.write_id}.json"), self._manifest(result))
         except BaseException:
-            self._cleanup()
+            self._discard_staging()
             self._state = "aborted"
             raise
-        finally:
-            if guard:
-                guard.release()
 
-        self._cleanup()
+        self._discard_staging()
         self._state = "committed"
         self.result = result
         return result
@@ -268,20 +276,13 @@ class PartitionedWriter:
     def abort(self) -> None:
         if self._state == "open":
             self._buffers.clear()
-            self._cleanup()
+            self._discard_staging()
             self._state = "aborted"
 
-    def _cleanup(self) -> None:
-        shutil.rmtree(self._staging, ignore_errors=True)
-        for parent in (self._staging.parent, self.root / "_trash"):
-            try:
-                parent.rmdir()  # only removes it if empty
-            except OSError:
-                pass
+    def _discard_staging(self) -> None:
+        self.storage.delete_prefix(self._staging)
 
-    def _write_manifest(self, result: WriteResult) -> None:
-        mdir = self.root / "_manifests"
-        mdir.mkdir(exist_ok=True)
+    def _manifest(self, result: DatasetWriteResult) -> bytes:
         body = {
             "write_id": result.write_id,
             "committed_at": _dt.datetime.now(_dt.timezone.utc).isoformat(timespec="seconds"),
@@ -292,9 +293,7 @@ class PartitionedWriter:
             "files": [asdict(f) for f in result.files],
             "skipped_partitions": result.skipped,
         }
-        tmp = mdir / f".{result.write_id}.json.tmp"
-        tmp.write_text(json.dumps(body, indent=2, default=str))
-        os.replace(tmp, mdir / f"{result.write_id}.json")
+        return json.dumps(body, indent=2, default=str).encode()
 
     def __enter__(self) -> "PartitionedWriter":
         return self
@@ -306,7 +305,7 @@ class PartitionedWriter:
             self.abort()
 
 
-def write_partitioned(records: Iterable[Mapping[str, Any]], root: str | os.PathLike[str], **kwargs: Any) -> WriteResult:
+def write_partitioned(records: Iterable[Mapping[str, Any]], root: Root, **kwargs: Any) -> DatasetWriteResult:
     """One-shot helper: write ``records`` and commit."""
     with PartitionedWriter(root, **kwargs) as w:
         w.write(records)
@@ -321,20 +320,18 @@ def write_partitioned(records: Iterable[Mapping[str, Any]], root: str | os.PathL
 Filter = Mapping[str, Any] | Callable[[dict[str, str | None]], bool]
 
 
-def list_partitions(root: str | os.PathLike[str], filters: Filter | None = None) -> list[dict[str, str | None]]:
+def list_partitions(root: Root, filters: Filter | None = None) -> list[dict[str, str | None]]:
     """Every partition that holds committed data, optionally pruned by ``filters``."""
-    root = Path(root)
+    st = open_storage(root)
     found = []
-    for directory in _walk_partitions(root):
-        if any(_is_data_file(p) for p in directory.iterdir()):
-            values = parse_partition_path(directory.relative_to(root))
-            if _matches(values, filters):
-                found.append(values)
+    for rel, files in _walk_partitions(st, "", filters):
+        if any(_is_data_name(n) for n in files):
+            found.append(parse_partition_path(rel))
     return sorted(found, key=lambda d: [str(v) for v in d.values()])
 
 
 def read_partitioned(
-    root: str | os.PathLike[str],
+    root: Root,
     *,
     filters: Filter | None = None,
     add_partition_columns: bool = True,
@@ -343,33 +340,34 @@ def read_partitioned(
 
     ``filters`` is either ``{"dt": "2026-11-01", "country": ["FR", "US"]}`` (values
     compared as strings; a list means "any of") or a callable taking the partition
-    dict. Partition values are added to records that do not already have them.
+    dict. Non-matching directories are never listed or opened, which matters on S3.
+    Partition values are added to records that do not already have them.
     """
-    root = Path(root)
-    if not root.exists():
-        raise DatasetError(f"dataset {root} does not exist")
-    for directory in _walk_partitions(root):
-        values = parse_partition_path(directory.relative_to(root))
-        if not _matches(values, filters):
-            continue
-        for path in sorted(p for p in directory.iterdir() if _is_data_file(p)):
-            for rec in _deserialise(path):
-                if add_partition_columns:
-                    for k, v in values.items():
-                        rec.setdefault(k, v)
-                yield rec
+    st = open_storage(root)
+    if not st.exists():
+        raise DatasetError(f"dataset {st.url} does not exist")
+    for rel, files in _walk_partitions(st, "", filters):
+        values = parse_partition_path(rel)
+        for name in files:
+            if not _is_data_name(name):
+                continue
+            with st.open_read(join(rel, name)) as fh:
+                for rec in _decode(fh, name):
+                    if add_partition_columns:
+                        for k, v in values.items():
+                            rec.setdefault(k, v)
+                    yield rec
 
 
-def _walk_partitions(root: Path) -> Iterator[Path]:
-    """Yield ``root`` and every visible ``key=value`` directory below it, depth first, sorted."""
-    yield root
-    try:
-        children = sorted(p for p in root.iterdir() if p.is_dir() and not p.name.startswith(("_", ".")))
-    except FileNotFoundError:
-        return
-    for child in children:
-        if "=" in child.name:
-            yield from _walk_partitions(child)
+def _walk_partitions(st: Storage, rel: str, filters: Filter | None) -> Iterator[tuple[str, list[str]]]:
+    """Yield ``(partition, file names)`` for ``rel`` and every visible ``key=value`` dir below it."""
+    if not _matches(parse_partition_path(rel), filters):
+        return  # prune: nothing below a non-matching partition can match
+    dirs, files = st.list_dir(rel)
+    yield rel, files
+    for name in dirs:
+        if "=" in name and not name.startswith(("_", ".")):
+            yield from _walk_partitions(st, join(rel, name), filters)
 
 
 def _matches(values: dict[str, str | None], filters: Filter | None) -> bool:
@@ -391,20 +389,7 @@ def _matches(values: dict[str, str | None], filters: Filter | None) -> bool:
 # --------------------------------------------------------------------------- #
 
 
-def _is_data_file(p: Path) -> bool:
-    return p.is_file() and not p.name.startswith(("_", ".")) and _format_of(p) is not None
-
-
-def _data_files(directory: Path) -> list[Path]:
-    return [p for p in directory.iterdir() if _is_data_file(p)]
-
-
-def _has_data(directory: Path) -> bool:
-    return directory.is_dir() and any(_is_data_file(p) for p in directory.iterdir())
-
-
-def _format_of(p: Path) -> tuple[str, bool] | None:
-    name = p.name
+def _format_of(name: str) -> tuple[str, bool] | None:
     gz = name.endswith(".gz")
     if gz:
         name = name[:-3]
@@ -414,10 +399,19 @@ def _format_of(p: Path) -> tuple[str, bool] | None:
     return None
 
 
-def _open_write(path: Path, compression: str | None) -> IO[str]:
-    if compression == "gzip":
-        return io.TextIOWrapper(gzip.open(path, "wb"), encoding="utf-8", newline="")
-    return path.open("w", encoding="utf-8", newline="")
+def _is_data_name(name: str) -> bool:
+    return not name.startswith(("_", ".")) and _format_of(name) is not None
+
+
+def _data_files(st: Storage, rel: str) -> list[str]:
+    return [join(rel, n) for n in st.list_dir(rel)[1] if _is_data_name(n)]
+
+
+def _encode(rows: list[Mapping[str, Any]], fmt: str, compression: str | None) -> bytes:
+    buf = io.StringIO(newline="")
+    _serialise(buf, rows, fmt)
+    data = buf.getvalue().encode("utf-8")
+    return gzip.compress(data, mtime=0) if compression == "gzip" else data
 
 
 def _serialise(fh: IO[str], rows: list[Mapping[str, Any]], fmt: str) -> None:
@@ -434,17 +428,16 @@ def _serialise(fh: IO[str], rows: list[Mapping[str, Any]], fmt: str) -> None:
     writer.writerows(rows)
 
 
-def _deserialise(path: Path) -> Iterator[dict[str, Any]]:
-    fmt, gz = _format_of(path)  # type: ignore[misc]
-    opener = (lambda: io.TextIOWrapper(gzip.open(path, "rb"), encoding="utf-8", newline="")) if gz \
-        else (lambda: path.open("r", encoding="utf-8", newline=""))
-    with opener() as fh:
-        if fmt == "jsonl":
-            for line in fh:
-                if line.strip():
-                    yield json.loads(line)
-        else:
-            yield from csv.DictReader(fh)
+def _decode(raw: BinaryIO, name: str) -> Iterator[dict[str, Any]]:
+    fmt, gz = _format_of(name)  # type: ignore[misc]
+    binary: BinaryIO = gzip.GzipFile(fileobj=raw) if gz else raw  # type: ignore[assignment]
+    text = io.TextIOWrapper(binary, encoding="utf-8", newline="")
+    if fmt == "jsonl":
+        for line in text:
+            if line.strip():
+                yield json.loads(line)
+    else:
+        yield from csv.DictReader(text)
 
 
 def _json_default(o: Any) -> Any:

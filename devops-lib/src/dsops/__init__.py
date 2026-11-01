@@ -1,13 +1,17 @@
 """dsops — a DevOps toolkit for distributed systems and data engineering.
 
-The core is dependency-free. Optional extras unlock YAML config (``dsops[yaml]``)
-and Redis-backed coordination (``dsops[redis]``).
+The core is dependency-free. Optional extras unlock YAML config (``dsops[yaml]``),
+Redis locks (``dsops[redis]``), Postgres (``dsops[postgres]``) and S3 (``dsops[s3]``).
+
+Every operational error dsops raises derives from :class:`dsops.DsopsError`;
+bad arguments raise ``ValueError``/``TypeError``; a missing optional driver
+raises ``ImportError`` naming the extra to install.
 
 Modules
 -------
 resilience   retry/backoff, circuit breaker, token-bucket rate limiter, bulkhead
 config       layered, typed configuration (defaults -> files -> env -> overrides)
-connectors   partitioned datasets on disk with atomic commits
+connectors   partitioned datasets (local or S3) and SQL tables (Postgres, SQLite)
 logs         structured JSON logging with context propagation
 metrics      counters, gauges, histograms with Prometheus exposition
 health       liveness/readiness checks and a tiny ops HTTP server
@@ -16,7 +20,7 @@ pipeline     DAG runner with retries/checkpoints, batching, data-quality checks
 """
 
 from .config import ConfigError, Secret, load_config
-from .connectors import PartitionedWriter, read_partitioned, write_partitioned
+from .connectors import Database, PartitionedWriter, read_partitioned, write_partitioned
 from .distributed import (
     ConsistentHashRing,
     FileLock,
@@ -25,6 +29,7 @@ from .distributed import (
     SQLiteIdempotencyStore,
     idempotent,
 )
+from .errors import DsopsError
 from .health import HealthRegistry, serve_ops
 from .logs import configure_logging, get_logger, log_context
 from .metrics import Counter, Gauge, Histogram, Registry, default_registry
@@ -50,6 +55,8 @@ __all__ = [
     "ConsistentHashRing",
     "Counter",
     "DAG",
+    "Database",
+    "DsopsError",
     "Field",
     "FileLock",
     "Gauge",

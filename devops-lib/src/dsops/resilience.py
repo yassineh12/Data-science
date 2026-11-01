@@ -16,6 +16,8 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Callable, Iterator, TypeVar
 
+from .errors import DsopsError
+
 log = logging.getLogger(__name__)
 
 F = TypeVar("F", bound=Callable[..., Any])
@@ -26,7 +28,7 @@ F = TypeVar("F", bound=Callable[..., Any])
 # --------------------------------------------------------------------------- #
 
 
-class RetryError(Exception):
+class RetryError(DsopsError):
     """Raised when every attempt failed. ``last_exception`` holds the final cause."""
 
     def __init__(self, attempts: int, last_exception: BaseException):
@@ -157,7 +159,7 @@ def _notify(
 # --------------------------------------------------------------------------- #
 
 
-class CircuitOpenError(Exception):
+class CircuitOpenError(DsopsError):
     """Raised instead of calling the protected function while the circuit is open."""
 
     def __init__(self, name: str, retry_after: float):
@@ -387,7 +389,7 @@ class TokenBucket:
 # --------------------------------------------------------------------------- #
 
 
-class BulkheadFullError(Exception):
+class BulkheadFullError(DsopsError):
     pass
 
 

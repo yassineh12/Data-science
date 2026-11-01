@@ -35,13 +35,15 @@ import typing
 from pathlib import Path
 from typing import Any, Mapping, Sequence, TypeVar, Union
 
+from .errors import DsopsError
+
 T = TypeVar("T")
 
 _TRUE = {"1", "true", "yes", "on", "y", "t"}
 _FALSE = {"0", "false", "no", "off", "n", "f", ""}
 
 
-class ConfigError(ValueError):
+class ConfigError(DsopsError, ValueError):
     """Raised for unreadable files, missing required values or values of the wrong type."""
 
 
@@ -96,11 +98,11 @@ def read_file(path: str | os.PathLike[str]) -> dict[str, Any]:
             try:
                 import yaml  # type: ignore[import-untyped]
             except ImportError as exc:  # pragma: no cover - depends on env
-                raise ConfigError("YAML config needs PyYAML: pip install 'dsops[yaml]'") from exc
+                raise ImportError("YAML config needs PyYAML: pip install 'dsops[yaml]'") from exc
             data = yaml.safe_load(text) or {}
         else:
             raise ConfigError(f"unsupported config format {suffix!r} for {p}")
-    except ConfigError:
+    except (ConfigError, ImportError):
         raise
     except Exception as exc:
         raise ConfigError(f"cannot parse config file {p}: {exc}") from exc

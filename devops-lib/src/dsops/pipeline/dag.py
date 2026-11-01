@@ -43,6 +43,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Iterable
 
+from ..errors import DsopsError
 from ..logs import copy_context_to, log_context
 from ..metrics import Counter, Histogram, Registry
 from ..resilience import RetryPolicy
@@ -56,7 +57,7 @@ UPSTREAM_FAILED = "upstream_failed"
 CANCELLED = "cancelled"
 
 
-class DAGError(Exception):
+class DAGError(DsopsError):
     pass
 
 

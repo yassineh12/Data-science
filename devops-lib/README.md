@@ -4,13 +4,14 @@ A DevOps toolkit for **distributed systems** and **data engineering** in Python.
 
 The core is stdlib-only, so it drops into any project — a notebook, a Lambda, a
 Kubernetes worker or an Airflow task — without dragging in a dependency tree.
-Optional extras add YAML config (`dsops[yaml]`) and Redis locks (`dsops[redis]`).
+Optional extras add YAML config (`dsops[yaml]`), Redis locks (`dsops[redis]`),
+Postgres (`dsops[postgres]`) and S3 (`dsops[s3]`).
 
 | Module | What it gives you |
 | --- | --- |
 | `dsops.resilience` | `retry` (sync + async, exponential backoff, full jitter), `CircuitBreaker`, `TokenBucket` rate limiter, `Bulkhead` |
-| `dsops.connectors` | Hive-style partitioned datasets on disk (`dt=2026-11-01/…`): JSONL or CSV, optional gzip, staged writes with atomic commit, append / overwrite / error / ignore modes, partition-pruned reads |
-| `dsops.connectors.sql` | Postgres (psycopg) and SQLite: batch writes in one transaction (append / upsert / replace-where), streaming reads via server-side cursors, incremental `read_since`, `ping` for health checks |
+| `dsops.connectors.dataset` | Hive-style partitioned datasets (`dt=2026-11-01/…`) on a local directory or S3: JSONL or CSV, optional gzip, staged writes, append / overwrite / error / ignore modes, partition-pruned reads |
+| `dsops.connectors.sql` | Postgres (psycopg) and SQLite tables: batch writes in one transaction (append / upsert / overwrite `where=`), streaming reads via server-side cursors, incremental `read_since`, `ping` for health checks |
 | `dsops.config` | Typed dataclass config, layered: defaults → TOML/JSON/YAML files → env vars → overrides; `Secret` values that never get logged |
 | `dsops.logs` | JSON logs with context (`job_id`, `run_id`, …) that follows work across threads and asyncio tasks |
 | `dsops.metrics` | `Counter`, `Gauge`, `Histogram` with labels; Prometheus text output, no client library |
@@ -77,11 +78,12 @@ dsops dag run  my_pkg.pipelines:dag --only load            # one task plus every
 dsops dag graph pipelines/orders.py:dag                     # paste into any Mermaid renderer
 ```
 
-### Partitioned datasets on disk
+### Partitioned datasets, local or S3
 
 ```python
 from dsops import PartitionedWriter, read_partitioned
 
+# "lake/orders" for a local directory, "s3://bucket/lake/orders" for S3 (pip install 'dsops[s3]')
 with PartitionedWriter("lake/orders", partition_by=["dt", "country"],
                        compression="gzip", mode="overwrite") as w:
     for batch in extract_batches():
@@ -101,9 +103,20 @@ leaves the dataset as it was. `mode="overwrite"` replaces only the partitions
 this write touches, which makes daily re-runs idempotent. Partition keys can be
 computed: `partition_by={"dt": lambda r: r["event_time"][:10]}`.
 
-Limits: each partition is committed atomically, but a write spanning several
-partitions is not one transaction. If a crash hits mid-commit, replaced data
-sits in `_trash/<write_id>/` for recovery. CSV reads every value back as a string.
+The same code runs against S3; pass an `S3Storage("bucket", "prefix", client=...)`
+instead of a URL to reuse a configured boto3 client. Filters prune by prefix, so
+a one-day read lists and opens only that day's objects.
+
+Local and S3 differ in one guarantee:
+
+| | Local directory | S3 |
+| --- | --- | --- |
+| Overwriting a partition | one directory rename: readers see old or new, never both | copy new objects in, then delete old ones: a reader listing in between can see both |
+| Concurrent writers | a file lock serialises commits | no built-in lock: pass `lock=RedisLock(...)` if two jobs may overwrite the same partition |
+
+Limits: a write spanning several partitions is not one transaction. If a crash
+hits mid-commit on local disk, replaced data sits in `_trash/<write_id>/` for
+recovery. CSV reads every value back as a string.
 
 ### Postgres and SQLite
 
@@ -113,7 +126,7 @@ from dsops.connectors import Database
 db = Database.postgres("postgresql://etl@db:5432/warehouse")   # pip install 'dsops[postgres]'
 
 # Idempotent daily reload: delete the day and insert it again, in one transaction.
-db.write_rows("orders", rows, mode="replace", replace_where={"dt": "2026-11-01"})
+db.write_rows("orders", rows, mode="overwrite", where={"dt": "2026-11-01"})
 
 # Merge on a primary key.
 db.write_rows("customers", rows, mode="upsert", key=["customer_id"])
@@ -134,6 +147,11 @@ readers keep seeing the old rows until commit. Each thread gets its own
 connection, reopened if the server dropped it; connecting is retried with
 backoff. `Database.sqlite("local.db")` has the same API (raw SQL uses `?`
 placeholders instead of `%s`), which makes it useful for tests and local runs.
+
+Datasets and tables share their vocabulary: `mode="append"` adds,
+`mode="overwrite"` replaces only the slice being written (partitions for a
+dataset, rows matching `where=` for a table), and both writers return a result
+with `.rows` and `.mode`.
 
 ### Calling things that fail
 
@@ -227,23 +245,34 @@ with log_context(batch_id=batch.id), latency.time():
 Pass `metrics=registry` to `DAG.run` to record `dsops_task_runs_total` and
 `dsops_task_duration_seconds` for every task.
 
+## Errors
+
+- Bad arguments (an unknown mode, a negative batch size) raise `ValueError` or `TypeError`.
+- Failures while doing the work raise a subclass of `dsops.DsopsError` (`RetryError`,
+  `CircuitOpenError`, `ConfigError`, `DatasetError`, `SQLError`, `DataQualityError`,
+  `PipelineFailed`, …), so `except DsopsError` catches dsops' failures and nothing else.
+- A missing optional driver raises `ImportError` naming the extra to install.
+
 ## Deploying
 
 `templates/` holds starting points you can copy into a project:
 
 - `Dockerfile` — multi-stage, non-root, health-checked
-- `docker-compose.yml` + `prometheus.yml` — app, Redis and Prometheus locally
+- `docker-compose.yml` + `prometheus.yml` — app, Postgres, Redis and Prometheus locally
 - `k8s/deployment.yaml` — worker with liveness/readiness probes and scrape annotations
 - `k8s/cronjob.yaml` — scheduled batch run that resumes from checkpoints on retry
 
 CI for this library lives in `.github/workflows/dsops.yml` at the repo root
-(tests on Python 3.11–3.13, runs the example pipeline, builds the wheel).
+(tests on Python 3.11–3.13 against a `postgres:16` service and moto's in-memory S3,
+runs the example pipeline, builds the wheel).
 
 ## Example
 
 `examples/etl_pipeline.py` wires everything together: config from env, a flaky
 API behind retry + circuit breaker, parallel extraction, a quality gate,
-hash-ring sharded idempotent loads, and Prometheus metrics.
+a hash-ring sharded partitioned dataset written with `mode="overwrite"` (so
+re-runs are idempotent; set `ETL_WAREHOUSE=s3://bucket/prefix` to target S3),
+and Prometheus metrics.
 
 ```bash
 python examples/etl_pipeline.py
@@ -267,6 +296,6 @@ cd devops-lib
 pip install -e ".[dev]"
 pytest -q
 
-# include the Postgres tests (CI runs them against a postgres:16 service)
+# S3 tests run against moto (installed by the dev extra); Postgres tests need a server:
 DSOPS_TEST_POSTGRES_DSN=postgresql://postgres:postgres@localhost:5432/postgres pytest -q
 ```

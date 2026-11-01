@@ -21,6 +21,8 @@ import uuid
 from pathlib import Path
 from typing import Any, Callable, Iterable, Protocol, TypeVar
 
+from .errors import DsopsError
+
 F = TypeVar("F", bound=Callable[..., Any])
 
 
@@ -114,7 +116,7 @@ class ConsistentHashRing:
 # --------------------------------------------------------------------------- #
 
 
-class LockNotAcquired(TimeoutError):
+class LockNotAcquired(DsopsError, TimeoutError):
     pass
 
 

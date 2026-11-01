@@ -11,7 +11,9 @@ What it shows
 * config      typed settings from defaults + env (ETL_SOURCE__FAILURE_RATE=0.5 ...)
 * resilience  retry with jittered backoff and a circuit breaker around a flaky "API"
 * pipeline    DAG with parallel branches, checkpoints, data-quality gate
-* distributed consistent hashing to assign partitions to workers, idempotent loads
+* distributed consistent hashing to assign rows to workers
+* connectors  a partitioned dataset written with mode="overwrite", so re-runs are idempotent
+              (set ETL_WAREHOUSE=s3://bucket/prefix to write to S3 instead of a local dir)
 * metrics     task/row counters exposed in Prometheus format
 """
 
@@ -30,13 +32,11 @@ from dsops import (
     Counter,
     Field,
     Schema,
-    SQLiteIdempotencyStore,
-    chunked,
-    idempotent,
     load_config,
     parallel_map,
     retry,
     validate_records,
+    write_partitioned,
 )
 from dsops.metrics import Registry
 from dsops.pipeline import in_range, matches, one_of
@@ -53,7 +53,7 @@ class Settings:
     source: Source = field(default_factory=Source)
     workers: list[str] = field(default_factory=lambda: ["worker-a", "worker-b", "worker-c"])
     max_error_rate: float = 0.05
-    warehouse_dir: str = str(Path(tempfile.gettempdir()) / "dsops-demo-warehouse")
+    warehouse: str = str(Path(tempfile.gettempdir()) / "dsops-demo-warehouse")  # or s3://bucket/prefix
 
 
 settings = load_config(Settings, env_prefix="ETL_")
@@ -105,7 +105,7 @@ def extract(ctx) -> list[dict]:
 @dag.task(depends_on=[extract])
 def validate(extract, ctx) -> list[dict]:
     report = validate_records(extract, ORDERS, min_rows=1)
-    ctx.log.info("quality report", extra=report.summary())
+    ctx.log.info("quality report", extra=report.to_dict())
     report.raise_if(max_error_rate=settings.max_error_rate)  # gate: stop bad data reaching the warehouse
     return report.valid
 
@@ -121,26 +121,27 @@ def revenue_by_status(validate) -> dict[str, float]:
 
 @dag.task(depends_on=[validate])
 def load(validate, ctx) -> dict[str, int]:
-    """Shard rows across workers with a hash ring; each shard write is idempotent."""
+    """Write one dataset partitioned by run and by owning worker (chosen with a hash ring).
+
+    mode="overwrite" replaces only this run's partitions, so re-running the same
+    run_id rewrites them instead of duplicating rows.
+    """
     ring = ConsistentHashRing(settings.workers)
-    out_dir = Path(settings.warehouse_dir) / ctx.run_id
-    out_dir.mkdir(parents=True, exist_ok=True)
-    store = SQLiteIdempotencyStore(out_dir / "_idempotency.db")
-
-    @idempotent(store, key=lambda worker, idx, rows: f"{ctx.run_id}:{worker}:{idx}")
-    def write_shard(worker: str, idx: int, rows: list[dict]) -> int:
-        (out_dir / f"{worker}-{idx:04d}.jsonl").write_text("\n".join(json.dumps(r) for r in rows))
-        rows_loaded.labels(worker).inc(len(rows))
-        return len(rows)
-
-    by_worker: dict[str, list[dict]] = {}
-    for r in validate:
-        by_worker.setdefault(ring.get_node(str(r["order_id"])), []).append(r)
-
-    written = {}
-    for worker, rows in sorted(by_worker.items()):
-        written[worker] = sum(write_shard(worker, i, chunk) for i, chunk in enumerate(chunked(rows, 250)))
-    return written
+    result = write_partitioned(
+        validate,
+        settings.warehouse,
+        partition_by={"run": lambda r: ctx.run_id, "worker": lambda r: ring.get_node(str(r["order_id"]))},
+        mode="overwrite",
+        compression="gzip",
+        max_rows_per_file=250,
+        write_id=ctx.run_id,
+    )
+    written: dict[str, int] = {}
+    for f in result.files:
+        written[f.partition["worker"]] = written.get(f.partition["worker"], 0) + f.rows
+    for worker, n in written.items():
+        rows_loaded.labels(worker).inc(n)
+    return dict(sorted(written.items()))
 
 
 @dag.task(depends_on=[revenue_by_status, load])

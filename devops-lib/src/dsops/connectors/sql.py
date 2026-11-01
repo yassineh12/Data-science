@@ -5,7 +5,7 @@
     db = Database.postgres("postgresql://etl@db:5432/warehouse")
 
     # idempotent daily reload: delete the day, insert the day, one transaction
-    db.write_rows("orders", rows, mode="replace", replace_where={"dt": "2026-11-01"})
+    db.write_rows("orders", rows, mode="overwrite", where={"dt": "2026-11-01"})
 
     # merge by primary key
     db.write_rows("customers", rows, mode="upsert", key=["customer_id"])
@@ -35,13 +35,14 @@ import uuid
 from dataclasses import dataclass
 from typing import Any, Callable, Iterable, Iterator, Mapping, Sequence
 
+from ..errors import DsopsError
 from ..resilience import RetryPolicy, retry
 
 Row = dict[str, Any]
-MODES = ("append", "upsert", "replace")
+MODES = ("append", "upsert", "overwrite")
 
 
-class SQLError(Exception):
+class SQLError(DsopsError):
     pass
 
 
@@ -53,13 +54,13 @@ class SQLError(Exception):
 def quote_ident(name: str) -> str:
     """``analytics.orders`` -> ``"analytics"."orders"``; embedded quotes are doubled."""
     if not name or "\x00" in name:
-        raise SQLError(f"invalid identifier {name!r}")
+        raise ValueError(f"invalid identifier {name!r}")
     return ".".join('"' + part.replace('"', '""') + '"' for part in name.split("."))
 
 
 def _quote_column(name: str) -> str:
     if not name or "\x00" in name:
-        raise SQLError(f"invalid column name {name!r}")
+        raise ValueError(f"invalid column name {name!r}")
     return '"' + name.replace('"', '""') + '"'
 
 
@@ -76,7 +77,7 @@ class Dialect:
     def upsert_sql(self, table: str, columns: Sequence[str], key: Sequence[str]) -> str:
         missing = [k for k in key if k not in columns]
         if missing:
-            raise SQLError(f"upsert key column(s) {missing} not in written columns")
+            raise ValueError(f"upsert key column(s) {missing} not in written columns")
         conflict = ", ".join(_quote_column(k) for k in key)
         updates = [c for c in columns if c not in key]
         if not updates:
@@ -106,7 +107,7 @@ DIALECTS = {"postgres": POSTGRES, "postgresql": POSTGRES, "sqlite": SQLITE}
 
 
 @dataclass
-class WriteStats:
+class TableWriteResult:
     table: str
     mode: str
     rows: int = 0
@@ -142,7 +143,7 @@ class Database:
         try:
             import psycopg  # type: ignore[import-not-found]
         except ImportError as exc:  # pragma: no cover - depends on env
-            raise SQLError("Postgres support needs psycopg: pip install 'dsops[postgres]'") from exc
+            raise ImportError("Postgres support needs psycopg: pip install 'dsops[postgres]'") from exc
         return cls(lambda: psycopg.connect(dsn), dialect="postgres", **kwargs)
 
     @classmethod
@@ -291,29 +292,32 @@ class Database:
         *,
         mode: str = "append",
         key: Sequence[str] | None = None,
-        replace_where: Mapping[str, Any] | None = None,
+        where: Mapping[str, Any] | None = None,
         columns: Sequence[str] | None = None,
         batch_size: int = 1_000,
-    ) -> WriteStats:
+    ) -> TableWriteResult:
         """Insert ``rows`` in batches inside one transaction — all of them land, or none do.
 
         append   plain INSERT
         upsert   INSERT ... ON CONFLICT (key) DO UPDATE (``key`` must be a unique/primary key)
-        replace  DELETE rows matching ``replace_where`` then INSERT. Pass ``replace_where={}``
-                 to replace the whole table. Readers see the old data until commit.
+        overwrite  DELETE rows matching ``where`` then INSERT — the table equivalent of a
+                   dataset partition overwrite. Pass ``where={}`` to replace the whole
+                   table. Readers see the old rows until commit.
         """
         if mode not in MODES:
-            raise SQLError(f"mode must be one of {MODES}")
+            raise ValueError(f"mode must be one of {MODES}")
         if mode == "upsert" and not key:
-            raise SQLError("mode='upsert' needs key=[...]")
-        if mode == "replace" and replace_where is None:
-            raise SQLError("mode='replace' needs replace_where={...} (use {} to replace the whole table)")
+            raise ValueError("mode='upsert' needs key=[...]")
+        if mode == "overwrite" and where is None:
+            raise ValueError("mode='overwrite' needs where={...} (use {} to overwrite the whole table)")
+        if where is not None and mode != "overwrite":
+            raise ValueError("where= only applies to mode='overwrite'")
         if batch_size < 1:
-            raise SQLError("batch_size must be >= 1")
+            raise ValueError("batch_size must be >= 1")
 
         it = iter(rows)
         first = next(it, None)
-        stats = WriteStats(table, mode)
+        stats = TableWriteResult(table, mode)
         if columns is None:
             columns = list(first.keys()) if first is not None else []
         columns = list(columns)
@@ -331,8 +335,8 @@ class Database:
             return tuple(r.get(c) for c in columns)
 
         with self.transaction() as cur:
-            if mode == "replace":
-                clause, params = self.dialect.where(replace_where or {})
+            if mode == "overwrite":
+                clause, params = self.dialect.where(where or {})
                 delete = f"DELETE FROM {quote_ident(table)}" + (f" WHERE {clause}" if clause else "")
                 cur.execute(delete, params)
                 stats.deleted = max(cur.rowcount, 0)
