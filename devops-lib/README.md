@@ -9,6 +9,7 @@ Optional extras add YAML config (`dsops[yaml]`) and Redis locks (`dsops[redis]`)
 | Module | What it gives you |
 | --- | --- |
 | `dsops.resilience` | `retry` (sync + async, exponential backoff, full jitter), `CircuitBreaker`, `TokenBucket` rate limiter, `Bulkhead` |
+| `dsops.connectors` | Hive-style partitioned datasets on disk (`dt=2026-11-01/…`): JSONL or CSV, optional gzip, staged writes with atomic commit, append / overwrite / error / ignore modes, partition-pruned reads |
 | `dsops.config` | Typed dataclass config, layered: defaults → TOML/JSON/YAML files → env vars → overrides; `Secret` values that never get logged |
 | `dsops.logs` | JSON logs with context (`job_id`, `run_id`, …) that follows work across threads and asyncio tasks |
 | `dsops.metrics` | `Counter`, `Gauge`, `Histogram` with labels; Prometheus text output, no client library |
@@ -74,6 +75,34 @@ dsops dag run  pipelines/orders.py:dag --param date='"2026-11-01"' --run-id 2026
 dsops dag run  my_pkg.pipelines:dag --only load            # one task plus everything it needs
 dsops dag graph pipelines/orders.py:dag                     # paste into any Mermaid renderer
 ```
+
+### Partitioned datasets on disk
+
+```python
+from dsops import PartitionedWriter, read_partitioned
+
+with PartitionedWriter("lake/orders", partition_by=["dt", "country"],
+                       compression="gzip", mode="overwrite") as w:
+    for batch in extract_batches():
+        w.write(batch)            # buffered per partition, rolled every 100k rows
+
+print(w.result.rows, w.result.partitions)
+# lake/orders/dt=2026-11-01/country=FR/part-<write_id>-00000.jsonl.gz
+# lake/orders/_manifests/<write_id>.json   <- files, rows and bytes for this write
+
+for row in read_partitioned("lake/orders", filters={"dt": "2026-11-01", "country": ["FR", "US"]}):
+    ...                           # only matching directories are opened
+```
+
+Files are written to `_staging/` and moved into place only on commit, so readers
+never see a half-written partition, and an exception inside the `with` block
+leaves the dataset as it was. `mode="overwrite"` replaces only the partitions
+this write touches, which makes daily re-runs idempotent. Partition keys can be
+computed: `partition_by={"dt": lambda r: r["event_time"][:10]}`.
+
+Limits: each partition is committed atomically, but a write spanning several
+partitions is not one transaction. If a crash hits mid-commit, replaced data
+sits in `_trash/<write_id>/` for recovery. CSV reads every value back as a string.
 
 ### Calling things that fail
 

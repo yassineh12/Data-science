@@ -7,6 +7,7 @@ Modules
 -------
 resilience   retry/backoff, circuit breaker, token-bucket rate limiter, bulkhead
 config       layered, typed configuration (defaults -> files -> env -> overrides)
+connectors   partitioned datasets on disk with atomic commits
 logs         structured JSON logging with context propagation
 metrics      counters, gauges, histograms with Prometheus exposition
 health       liveness/readiness checks and a tiny ops HTTP server
@@ -15,6 +16,7 @@ pipeline     DAG runner with retries/checkpoints, batching, data-quality checks
 """
 
 from .config import ConfigError, Secret, load_config
+from .connectors import PartitionedWriter, read_partitioned, write_partitioned
 from .distributed import (
     ConsistentHashRing,
     FileLock,
@@ -55,6 +57,7 @@ __all__ = [
     "Histogram",
     "InMemoryIdempotencyStore",
     "LockNotAcquired",
+    "PartitionedWriter",
     "Registry",
     "RetryError",
     "SQLiteIdempotencyStore",
@@ -69,8 +72,10 @@ __all__ = [
     "load_config",
     "log_context",
     "parallel_map",
+    "read_partitioned",
     "retry",
     "serve_ops",
     "validate_records",
+    "write_partitioned",
     "__version__",
 ]
